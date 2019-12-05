@@ -368,13 +368,13 @@ func ZA(pub *PublicKey, uid []byte) ([]byte, error) {
 	za.Write(sm2P256.Gx.Bytes())
 	za.Write(sm2P256.Gy.Bytes())
 
-	xBuf := pub.X.Bytes()
-	yBuf := pub.Y.Bytes()
-	if n := len(xBuf); n < 32 {
-		xBuf = append(zeroByteSlice()[:32-n], xBuf...)
-	}
-	za.Write(xBuf)
-	za.Write(yBuf)
+	//xBuf := pub.X.Bytes()
+	//yBuf := pub.Y.Bytes()
+	//if n := len(xBuf); n < 32 {
+	//	xBuf = append(zeroByteSlice()[:32-n], xBuf...)
+	//}
+	//za.Write(xBuf)
+	//za.Write(yBuf)
 	return za.Sum(nil)[:32], nil
 }
 
@@ -522,6 +522,9 @@ func Decompress(a []byte) *PublicKey {
 
 	y2 := sm2P256ToBig(&xx3)
 	y := new(big.Int).ModSqrt(y2, sm2P256.P)
+	if y == nil {
+		return nil
+	}
 	if getLastBit(y) != uint(a[0]) {
 		y.Sub(sm2P256.P, y)
 	}
@@ -530,4 +533,118 @@ func Decompress(a []byte) *PublicKey {
 		X:     x,
 		Y:     y,
 	}
+}
+
+// ySign == true, use negative y
+func doRecover(msg []byte, sign []byte, ySign bool) (pub *PublicKey, result bool) {
+	var sm2Sign sm2Signature
+
+	_, err := asn1.Unmarshal(sign, &sm2Sign)
+	if err != nil {
+		return nil, false
+	}
+
+	curve := P256Sm2()
+	//C1
+	if sm2Sign.R.Cmp(curve.Params().N) >= 0 || sm2Sign.R.Sign() <= 0 {
+		return nil, false
+	}
+
+	//C2
+	if sm2Sign.S.Cmp(curve.Params().N) >= 0 || sm2Sign.S.Sign() <= 0 {
+		return nil, false
+	}
+
+	//C3
+	t := new(big.Int).Add(sm2Sign.R, sm2Sign.S)
+	t.Mod(t, curve.Params().N)
+
+	//C4
+	tInv := t.ModInverse(t, curve.Params().N)
+	if tInv.Sign() == 0 {
+		return nil, false
+	}
+
+	//C5
+	za, err := ZA(nil, nil)
+	if err != nil {
+		return nil, false
+	}
+	e, err := msgHash(za, msg)
+	if err != nil {
+		return nil, false
+	}
+	x := new(big.Int).Sub(sm2Sign.R, e)
+	x.Mod(x, curve.Params().N)
+	if x.Sign() == 0 {
+		return nil, false
+	}
+
+	//C6
+	a := append([]byte{byte(0)}, x.Bytes()...)
+	U := Decompress(a)
+	if U == nil {
+		return nil, false
+	}
+
+	//C7
+	sG_x, sG_y := curve.ScalarBaseMult(sm2Sign.S.Bytes())
+
+	//C8
+	sG_y_inv := new(big.Int).Sub(sm2P256.P, sG_y)
+	U_sG_x, U_sG_y := curve.Add(U.X, U.Y, sG_x, sG_y_inv)
+
+	pub = new(PublicKey)
+	pub.X, pub.Y = curve.ScalarMult(U_sG_x, U_sG_y, tInv.Bytes())
+
+	expectedLastBit := uint(0)
+	if ySign == true {
+		expectedLastBit = 1
+	}
+	if getLastBit(pub.Y) != expectedLastBit {
+		U_sG_x, U_sG_y = curve.Add(U.X, U.Y.Sub(sm2P256.P, U.Y), sG_x, sG_y_inv)
+		pub.X, pub.Y = curve.ScalarMult(U_sG_x, U_sG_y, tInv.Bytes())
+	}
+	pub.Curve = curve
+
+	return pub, true
+}
+
+func SignExt(priv *PrivateKey, msg []byte) (r, s, v *big.Int, err error) {
+	sign, err := priv.Sign(rand.Reader, msg, nil)
+	if err != nil {
+		return
+	}
+
+	var sm2Sign sm2Signature
+	_, err = asn1.Unmarshal(sign, &sm2Sign)
+	if err != nil {
+		return
+	}
+
+	v = new(big.Int).SetUint64(uint64(getLastBit(priv.Y)))
+	return sm2Sign.R, sm2Sign.S, v, nil
+}
+
+func VerifyExt(pub *PublicKey, msg []byte, r, s, v *big.Int) bool {
+	if getLastBit(pub.Y) != uint(v.Uint64()) {
+		panic("aaa")
+		return false
+	}
+
+	sign, err := asn1.Marshal(sm2Signature{r, s})
+	if err != nil {
+		return false
+	}
+
+	return pub.Verify(msg, sign)
+}
+
+func Ecrecover(msg []byte, r, s, v *big.Int) (*PublicKey, bool) {
+	sign, err := asn1.Marshal(sm2Signature{r, s})
+	if err != nil {
+		return nil, false
+	}
+
+	return doRecover(msg, sign, v.Sign() != 0)
 }

@@ -77,7 +77,7 @@ func SignDataToSignDigit(sign []byte) (*big.Int, *big.Int, error) {
 // sign format = 30 + len(z) + 02 + len(r) + r + 02 + len(s) + s, z being what follows its size, ie 02+len(r)+r+02+len(s)+s
 func (priv *PrivateKey) Sign(rand io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte, error) {
 	// r, s, err := Sign(priv, msg)
-	r, s, err := Sm2Sign(priv, msg, nil)
+	r, s, _, err := Sm2Sign(priv, msg, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -265,19 +265,19 @@ func Verify(pub *PublicKey, hash []byte, r, s *big.Int) bool {
 	return x.Cmp(r) == 0
 }
 
-func Sm2Sign(priv *PrivateKey, msg, uid []byte) (r, s *big.Int, err error) {
+func Sm2Sign(priv *PrivateKey, msg, uid []byte) (r, s, v *big.Int, err error) {
 	za, err := ZA(&priv.PublicKey, uid)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	e, err := msgHash(za, msg)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	c := priv.PublicKey.Curve
 	N := c.Params().N
 	if N.Sign() == 0 {
-		return nil, nil, errZeroParam
+		return nil, nil, nil, errZeroParam
 	}
 	var k *big.Int
 	for { // 调整算法细节以实现SM2
@@ -287,7 +287,8 @@ func Sm2Sign(priv *PrivateKey, msg, uid []byte) (r, s *big.Int, err error) {
 				r = nil
 				return
 			}
-			r, _ = priv.Curve.ScalarBaseMult(k.Bytes())
+			r, v = priv.Curve.ScalarBaseMult(k.Bytes())
+			v.SetUint64(uint64(getLastBit(v)))
 			r.Add(r, e)
 			r.Mod(r, N)
 			if r.Sign() != 0 {
@@ -586,6 +587,13 @@ func doRecover(msg []byte, sign []byte, ySign bool) (pub *PublicKey, result bool
 	if U == nil {
 		return nil, false
 	}
+	expectedLastBit := uint(0)
+	if ySign == true {
+		expectedLastBit = 1
+	}
+	if getLastBit(U.Y) != expectedLastBit {
+		U.Y.Sub(sm2P256.P, U.Y)
+	}
 
 	//C7
 	sG_x, sG_y := curve.ScalarBaseMult(sm2Sign.S.Bytes())
@@ -596,42 +604,16 @@ func doRecover(msg []byte, sign []byte, ySign bool) (pub *PublicKey, result bool
 
 	pub = new(PublicKey)
 	pub.X, pub.Y = curve.ScalarMult(U_sG_x, U_sG_y, tInv.Bytes())
-
-	expectedLastBit := uint(0)
-	if ySign == true {
-		expectedLastBit = 1
-	}
-	if getLastBit(pub.Y) != expectedLastBit {
-		U_sG_x, U_sG_y = curve.Add(U.X, U.Y.Sub(sm2P256.P, U.Y), sG_x, sG_y_inv)
-		pub.X, pub.Y = curve.ScalarMult(U_sG_x, U_sG_y, tInv.Bytes())
-	}
 	pub.Curve = curve
 
 	return pub, true
 }
 
 func SignExt(priv *PrivateKey, msg []byte) (r, s, v *big.Int, err error) {
-	sign, err := priv.Sign(rand.Reader, msg, nil)
-	if err != nil {
-		return
-	}
-
-	var sm2Sign sm2Signature
-	_, err = asn1.Unmarshal(sign, &sm2Sign)
-	if err != nil {
-		return
-	}
-
-	v = new(big.Int).SetUint64(uint64(getLastBit(priv.Y)))
-	return sm2Sign.R, sm2Sign.S, v, nil
+	return Sm2Sign(priv, msg, nil)
 }
 
 func VerifyExt(pub *PublicKey, msg []byte, r, s, v *big.Int) bool {
-	if getLastBit(pub.Y) != uint(v.Uint64()) {
-		panic("aaa")
-		return false
-	}
-
 	sign, err := asn1.Marshal(sm2Signature{r, s})
 	if err != nil {
 		return false
